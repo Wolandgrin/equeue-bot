@@ -95,6 +95,7 @@ class Monitor:
         self.token = os.getenv("BOT_TOKEN", "").strip()
         self.chat_id = os.getenv("CHAT_ID", "").strip()
         self.was_available = False
+        self.was_ratelimited = False
         self.last_status = "?"
         self.last_heartbeat = 0.0
         self.last_error_sent = 0.0
@@ -194,7 +195,13 @@ class Monitor:
 
                     if status == "ratelimited":
                         self.last_status = "rate-limit (забагато запитів)"
+                        mins = max(1, self.cooldown // 60)
                         print("[{}] rate-limited (too many requests) — back off {}s".format(ts(), self.cooldown))
+                        if not self.was_ratelimited:
+                            self.was_ratelimited = True
+                            self.notify(
+                                "⚠️ Забагато запитів (too many requests).\n"
+                                "Чекаю {} хв і пробую знову.\nЧас: {}".format(mins, ts()))
                         self.was_available = False
                         self.maybe_heartbeat()
                         await asyncio.sleep(self.cooldown)
@@ -215,6 +222,7 @@ class Monitor:
                         print("[{}] зайнято (всі місця зайняті)".format(ts()))
                         self.was_available = False
 
+                    self.was_ratelimited = False
                     self.maybe_heartbeat()
                     await asyncio.sleep(self.poll)
             except (KeyboardInterrupt, asyncio.CancelledError):
@@ -228,8 +236,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="e-queue availability monitor + Telegram alert (read-only)")
     parser.add_argument("--url", default=DEFAULT_URL, help="e-queue page URL")
     parser.add_argument("--poll", type=int, default=300, help="seconds between checks (default 300 = 5 min)")
-    parser.add_argument("--cooldown", type=int, default=900,
-                        help="seconds to wait after a 'too many requests' page (default 900 = 15 min)")
+    parser.add_argument("--cooldown", type=int, default=600,
+                        help="seconds to wait after a 'too many requests' page (default 600 = 10 min)")
     parser.add_argument("--heartbeat-hours", type=float, default=4.0,
                         help="hours between 'still alive' pings (0 = off, default 4)")
     args = parser.parse_args()
