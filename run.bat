@@ -12,8 +12,9 @@ if not exist .venv\Scripts\python.exe (
 )
 
 REM Pass any extra args through, e.g.:  run.bat --services 4,7 --poll 45
-.venv\Scripts\python.exe equeue_probe.py %*
+echo Running... output is also saved to run.log
+.venv\Scripts\python.exe -u equeue_probe.py %* > run.log 2>&1
 
 echo.
-echo === script exited ===
+echo === script exited (see run.log) ===
 pause
