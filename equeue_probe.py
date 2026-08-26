@@ -26,6 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from playwright.async_api import async_playwright
+
 # Force UTF-8 on stdout/stderr so non-ASCII (Ukrainian/Czech) text and emoji do
 # not crash print() on Windows consoles that default to cp1251.
 try:
@@ -33,8 +35,6 @@ try:
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
 except Exception:
     pass
-
-from playwright.async_api import async_playwright  # noqa: E402
 
 DEFAULT_URL = "https://prague.pasport.org.ua/solutions/e-queue"
 PROFILE_DIR = ".equeue_profile"
