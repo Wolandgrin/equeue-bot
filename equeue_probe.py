@@ -24,7 +24,6 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from playwright.async_api import async_playwright
 
@@ -48,6 +47,12 @@ BUSY_MARKERS = [
 # Must be present for us to trust that the e-queue page really loaded (not a
 # Cloudflare check, waiting-room queue, or a blank/error page).
 PAGE_MARKER = "електронна черга"
+
+# The site rate-limits aggressive polling with a "Too many requests" page.
+RATE_LIMIT_MARKERS = [
+    "too many requests",
+    "забагато запитів",
+]
 
 ERROR_THROTTLE_SEC = 30 * 60  # send at most one error alert per 30 min
 
@@ -82,9 +87,10 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
 
 
 class Monitor:
-    def __init__(self, url: str, poll: int, heartbeat_hours: float) -> None:
+    def __init__(self, url: str, poll: int, heartbeat_hours: float, cooldown: int) -> None:
         self.url = url
         self.poll = poll
+        self.cooldown = cooldown
         self.heartbeat_sec = heartbeat_hours * 3600.0
         self.token = os.getenv("BOT_TOKEN", "").strip()
         self.chat_id = os.getenv("CHAT_ID", "").strip()
@@ -123,16 +129,18 @@ class Monitor:
         self.notify("\U0001F7E2 Бот працює, перевіряю кожні {}s.\nПоточний стан: {}\nЧас: {}".format(
             self.poll, self.last_status, ts()))
 
-    async def check(self, page) -> Optional[bool]:
-        """Return True if booking is possible, False if busy, None if the page
-        is not properly loaded yet (Cloudflare / waiting room / loading)."""
+    async def check(self, page) -> str:
+        """Return one of: 'available', 'busy', 'ratelimited', 'notready'."""
         await page.goto(self.url, wait_until="domcontentloaded", timeout=60000)
         await asyncio.sleep(2)
         text = (await page.inner_text("body")).lower()
+        if any(m in text for m in RATE_LIMIT_MARKERS):
+            return "ratelimited"
         if PAGE_MARKER not in text:
-            return None
-        busy = any(m in text for m in BUSY_MARKERS)
-        return not busy
+            return "notready"
+        if any(m in text for m in BUSY_MARKERS):
+            return "busy"
+        return "available"
 
     def alert(self) -> None:
         city = self.url.split("//")[-1].split(".")[0]
@@ -178,23 +186,31 @@ class Monitor:
             try:
                 while True:
                     try:
-                        available = await self.check(page)
+                        status = await self.check(page)
                     except Exception as e:
                         print("[{}] check error: {}".format(ts(), e))
                         self.maybe_error(e)
-                        available = None
+                        status = "notready"
 
-                    if available is None:
+                    if status == "ratelimited":
+                        self.last_status = "rate-limit (забагато запитів)"
+                        print("[{}] rate-limited (too many requests) — back off {}s".format(ts(), self.cooldown))
+                        self.was_available = False
+                        self.maybe_heartbeat()
+                        await asyncio.sleep(self.cooldown)
+                        continue
+
+                    if status == "notready":
                         self.last_status = "не завантажилось (Cloudflare/черга?)"
                         print("[{}] page not ready (Cloudflare/queue/loading?) — waiting".format(ts()))
                         self.was_available = False
-                    elif available:
+                    elif status == "available":
                         self.last_status = "ВІЛЬНО"
                         print("[{}] ВІЛЬНО — запис можливий!".format(ts()))
                         if not self.was_available:
                             self.was_available = True
                             self.alert()
-                    else:
+                    else:  # busy
                         self.last_status = "зайнято"
                         print("[{}] зайнято (всі місця зайняті)".format(ts()))
                         self.was_available = False
@@ -211,11 +227,13 @@ def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(description="e-queue availability monitor + Telegram alert (read-only)")
     parser.add_argument("--url", default=DEFAULT_URL, help="e-queue page URL")
-    parser.add_argument("--poll", type=int, default=60, help="seconds between checks (default 60)")
+    parser.add_argument("--poll", type=int, default=300, help="seconds between checks (default 300 = 5 min)")
+    parser.add_argument("--cooldown", type=int, default=900,
+                        help="seconds to wait after a 'too many requests' page (default 900 = 15 min)")
     parser.add_argument("--heartbeat-hours", type=float, default=4.0,
                         help="hours between 'still alive' pings (0 = off, default 4)")
     args = parser.parse_args()
-    asyncio.run(Monitor(args.url, args.poll, args.heartbeat_hours).run())
+    asyncio.run(Monitor(args.url, args.poll, args.heartbeat_hours, args.cooldown).run())
 
 
 if __name__ == "__main__":
