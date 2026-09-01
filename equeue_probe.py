@@ -18,6 +18,7 @@ Read-only: it books nothing.
 import argparse
 import asyncio
 import os
+import random
 import sys
 import time
 import urllib.parse
@@ -38,8 +39,13 @@ except Exception:
 DEFAULT_URL = "https://prague.pasport.org.ua/solutions/e-queue"
 PROFILE_DIR = ".equeue_profile"
 
+# After picking a service in the dropdown, the page shows a busy notice while no
+# slots are free. We select the service, then look for these markers.
+DEFAULT_SERVICE = "Закордонний паспорт та (або) ID-картка"
+
 # If any of these appear, all slots are taken (no booking possible right now).
 BUSY_MARKERS = [
+    "вибачте, на даний момент всі місця зайняті",
     "всі місця зайняті",
     "спробуйте в інший час",
     "кількість талонів обмежена",
@@ -87,10 +93,13 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
 
 
 class Monitor:
-    def __init__(self, url: str, poll: int, heartbeat_hours: float, cooldown: int) -> None:
+    def __init__(self, url: str, poll: int, heartbeat_hours: float, cooldown: int,
+                 service: str, jitter: int) -> None:
         self.url = url
         self.poll = poll
         self.cooldown = cooldown
+        self.service = service
+        self.jitter = max(0, jitter)
         self.heartbeat_sec = heartbeat_hours * 3600.0
         self.token = os.getenv("BOT_TOKEN", "").strip()
         self.chat_id = os.getenv("CHAT_ID", "").strip()
@@ -130,6 +139,27 @@ class Monitor:
         self.notify("\U0001F7E2 Бот працює, перевіряю кожні {}s.\nПоточний стан: {}\nЧас: {}".format(
             self.poll, self.last_status, ts()))
 
+    def poll_delay(self) -> float:
+        """Base poll interval plus random jitter so requests are not identical."""
+        if self.jitter <= 0:
+            return float(self.poll)
+        return self.poll + random.uniform(-self.jitter, self.jitter)
+
+    async def select_service(self, page) -> bool:
+        """Pick the wanted service in a native <select>. Return True on success."""
+        target = self.service.lower()
+        for sel in await page.query_selector_all("select"):
+            for opt in await sel.query_selector_all("option"):
+                label = (await opt.inner_text()).strip()
+                if target in label.lower():
+                    value = await opt.get_attribute("value")
+                    if value is not None:
+                        await sel.select_option(value=value)
+                    else:
+                        await sel.select_option(label=label)
+                    return True
+        return False
+
     async def check(self, page) -> str:
         """Return one of: 'available', 'busy', 'ratelimited', 'notready'."""
         await page.goto(self.url, wait_until="domcontentloaded", timeout=60000)
@@ -139,6 +169,14 @@ class Monitor:
             return "ratelimited"
         if PAGE_MARKER not in text:
             return "notready"
+        if not await self.select_service(page):
+            print("[{}] service '{}' not found in dropdown yet".format(ts(), self.service))
+            return "notready"
+        # Give the page time to load availability for the chosen service.
+        await asyncio.sleep(2)
+        text = (await page.inner_text("body")).lower()
+        if any(m in text for m in RATE_LIMIT_MARKERS):
+            return "ratelimited"
         if any(m in text for m in BUSY_MARKERS):
             return "busy"
         return "available"
@@ -175,14 +213,17 @@ class Monitor:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
             print("[{}] Monitoring {}".format(ts(), self.url))
-            print("Reloads every {}s. If a Cloudflare/queue page shows once, pass it manually.".format(self.poll))
+            print("Service: {}".format(self.service))
+            print("Reloads every ~{}s (+/-{}s). If a Cloudflare/queue page shows once, pass it manually.".format(
+                self.poll, self.jitter))
             print("Telegram: {}".format("ON" if self.tg_on else "OFF (set BOT_TOKEN/CHAT_ID in .env)"))
             print("Heartbeat: {}".format(
                 "every {}h".format(self.heartbeat_sec / 3600.0) if self.heartbeat_sec > 0 else "off"))
             print("Ctrl+C to stop.\n")
 
             self.last_heartbeat = time.monotonic()
-            self.notify("\U0001F916 e-queue монітор запущено.\nПеревірка кожні {}s: {}".format(self.poll, self.url))
+            self.notify("\U0001F916 e-queue монітор запущено.\nПослуга: {}\nПеревірка кожні ~{}s (+/-{}s): {}".format(
+                self.service, self.poll, self.jitter, self.url))
 
             try:
                 while True:
@@ -224,7 +265,7 @@ class Monitor:
 
                     self.was_ratelimited = False
                     self.maybe_heartbeat()
-                    await asyncio.sleep(self.poll)
+                    await asyncio.sleep(self.poll_delay())
             except (KeyboardInterrupt, asyncio.CancelledError):
                 pass
             finally:
@@ -235,13 +276,19 @@ def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(description="e-queue availability monitor + Telegram alert (read-only)")
     parser.add_argument("--url", default=DEFAULT_URL, help="e-queue page URL")
-    parser.add_argument("--poll", type=int, default=300, help="seconds between checks (default 300 = 5 min)")
+    parser.add_argument("--poll", type=int, default=60,
+                        help="base seconds between checks (default 60)")
+    parser.add_argument("--jitter", type=int, default=10,
+                        help="random +/- seconds added to each poll (default 10 => 50-70s)")
+    parser.add_argument("--service", default=DEFAULT_SERVICE,
+                        help="dropdown option text to select (substring match)")
     parser.add_argument("--cooldown", type=int, default=600,
                         help="seconds to wait after a 'too many requests' page (default 600 = 10 min)")
     parser.add_argument("--heartbeat-hours", type=float, default=4.0,
                         help="hours between 'still alive' pings (0 = off, default 4)")
     args = parser.parse_args()
-    asyncio.run(Monitor(args.url, args.poll, args.heartbeat_hours, args.cooldown).run())
+    asyncio.run(Monitor(args.url, args.poll, args.heartbeat_hours, args.cooldown,
+                        args.service, args.jitter).run())
 
 
 if __name__ == "__main__":
