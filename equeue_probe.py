@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import os
 import random
+import re
 import sys
 import time
 import urllib.parse
@@ -60,6 +61,13 @@ RATE_LIMIT_MARKERS = [
     "забагато запитів",
 ]
 
+# Positive availability signal: when a slot opens, the "Обрати день" (choose
+# day) dropdown lists a bookable date in DD.MM.YYYY form. When all slots are
+# taken that dropdown is empty and no such dotted date appears anywhere on the
+# page (news uses word-months like "28 вересня 2026"). We alert only when this
+# date is present, instead of merely when the busy notice is absent.
+DAY_DATE_RE = re.compile(r"\b\d{2}\.\d{2}\.\d{4}\b")
+
 ERROR_THROTTLE_SEC = 30 * 60  # send at most one error alert per 30 min
 
 
@@ -94,7 +102,8 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
 
 class Monitor:
     def __init__(self, url: str, poll: int, heartbeat_hours: float, cooldown: int,
-                 service: str, jitter: int, confirm: int = 2, confirm_delay: int = 5) -> None:
+                 service: str, jitter: int, confirm: int = 2, confirm_delay: int = 5,
+                 dump_only: bool = False) -> None:
         self.url = url
         self.poll = poll
         self.cooldown = cooldown
@@ -102,6 +111,7 @@ class Monitor:
         self.jitter = max(0, jitter)
         self.confirm = max(0, confirm)
         self.confirm_delay = max(1, confirm_delay)
+        self.dump_only = dump_only
         self.heartbeat_sec = heartbeat_hours * 3600.0
         self.token = os.getenv("BOT_TOKEN", "").strip()
         self.chat_id = os.getenv("CHAT_ID", "").strip()
@@ -181,7 +191,12 @@ class Monitor:
             return "ratelimited"
         if any(m in text for m in BUSY_MARKERS):
             return "busy"
-        return "available"
+        # Require a positive signal (a bookable DD.MM.YYYY date) before we treat
+        # the page as open. Absence of the busy notice alone is not enough — a
+        # page caught mid-load shows neither, and that used to fire false alerts.
+        if DAY_DATE_RE.search(text):
+            return "available"
+        return "notready"
 
     async def confirm_available(self, page) -> bool:
         """Re-check a few times to filter out transient false 'available'
@@ -206,7 +221,7 @@ class Monitor:
         city = self.url.split("//")[-1].split(".")[0]
         text = "\n".join([
             "\U0001F7E2 Зʼявилась можливість запису! ({})".format(city),
-            "Блок «всі місця зайняті» зник — заходь і обирай час:",
+            "У «Обрати день» зʼявилась вільна дата — заходь і бронюй:",
             self.url,
         ])
         print("\n[{}] *** ЗАПИС ВІДКРИВСЯ *** {}".format(ts(), self.url))
@@ -232,6 +247,24 @@ class Monitor:
                 self.notify("\u26A0\uFE0F e-queue монітор НЕ запустився (браузер): {}".format(e))
                 raise
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+
+            if self.dump_only:
+                status = await self.check(page)
+                full = await page.inner_text("body")
+                low = full.lower()
+                print("[{}] DUMP status={} url={}".format(ts(), status, page.url))
+                print("page marker present: {}".format(PAGE_MARKER in low))
+                print("busy markers matched: {}".format([m for m in BUSY_MARKERS if m in low]))
+                print("rate-limit matched: {}".format([m for m in RATE_LIMIT_MARKERS if m in low]))
+                for si, sel in enumerate(await page.query_selector_all("select")):
+                    opts = []
+                    for opt in await sel.query_selector_all("option"):
+                        opts.append((await opt.inner_text()).strip())
+                    print("SELECT[{}] options: {}".format(si, opts))
+                Path("dump.txt").write_text(full, encoding="utf-8")
+                print("saved full body text -> dump.txt ({} chars)".format(len(full)))
+                await ctx.close()
+                return
 
             print("[{}] Monitoring {}".format(ts(), self.url))
             print("Service: {}".format(self.service))
@@ -317,9 +350,13 @@ def main() -> None:
                              "out transient false 'available' blips (0 = off, default 2)")
     parser.add_argument("--confirm-delay", type=int, default=5,
                         help="seconds between confirmation re-checks (default 5)")
+    parser.add_argument("--dump", action="store_true",
+                        help="one-shot: open page, select service, print detected status and "
+                             "save the full body text to dump.txt, then exit")
     args = parser.parse_args()
     asyncio.run(Monitor(args.url, args.poll, args.heartbeat_hours, args.cooldown,
-                        args.service, args.jitter, args.confirm, args.confirm_delay).run())
+                        args.service, args.jitter, args.confirm, args.confirm_delay,
+                        dump_only=args.dump).run())
 
 
 if __name__ == "__main__":
