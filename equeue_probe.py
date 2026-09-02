@@ -94,12 +94,14 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
 
 class Monitor:
     def __init__(self, url: str, poll: int, heartbeat_hours: float, cooldown: int,
-                 service: str, jitter: int) -> None:
+                 service: str, jitter: int, confirm: int = 2, confirm_delay: int = 5) -> None:
         self.url = url
         self.poll = poll
         self.cooldown = cooldown
         self.service = service
         self.jitter = max(0, jitter)
+        self.confirm = max(0, confirm)
+        self.confirm_delay = max(1, confirm_delay)
         self.heartbeat_sec = heartbeat_hours * 3600.0
         self.token = os.getenv("BOT_TOKEN", "").strip()
         self.chat_id = os.getenv("CHAT_ID", "").strip()
@@ -181,6 +183,25 @@ class Monitor:
             return "busy"
         return "available"
 
+    async def confirm_available(self, page) -> bool:
+        """Re-check a few times to filter out transient false 'available'
+        readings (page caught mid-load before the busy block rendered).
+
+        A real slot opening persists for minutes, so it survives repeated
+        checks; a one-poll rendering blip does not. Returns True only if
+        every extra check also reports 'available'."""
+        for i in range(self.confirm):
+            await asyncio.sleep(self.confirm_delay)
+            try:
+                status = await self.check(page)
+            except Exception as e:
+                print("[{}] confirm check error: {}".format(ts(), e))
+                return False
+            print("[{}] confirm {}/{}: {}".format(ts(), i + 1, self.confirm, status))
+            if status != "available":
+                return False
+        return True
+
     def alert(self) -> None:
         city = self.url.split("//")[-1].split(".")[0]
         text = "\n".join([
@@ -253,11 +274,16 @@ class Monitor:
                         print("[{}] page not ready (Cloudflare/queue/loading?) — waiting".format(ts()))
                         self.was_available = False
                     elif status == "available":
-                        self.last_status = "ВІЛЬНО"
-                        print("[{}] ВІЛЬНО — запис можливий!".format(ts()))
-                        if not self.was_available:
-                            self.was_available = True
-                            self.alert()
+                        if not self.was_available and self.confirm and not await self.confirm_available(page):
+                            self.last_status = "хибне ВІЛЬНО (не підтвердилось)"
+                            print("[{}] хибне ВІЛЬНО — не підтвердилось повторною перевіркою, пропускаю".format(ts()))
+                            self.was_available = False
+                        else:
+                            self.last_status = "ВІЛЬНО"
+                            print("[{}] ВІЛЬНО — запис можливий!".format(ts()))
+                            if not self.was_available:
+                                self.was_available = True
+                                self.alert()
                     else:  # busy
                         self.last_status = "зайнято"
                         print("[{}] зайнято (всі місця зайняті)".format(ts()))
@@ -286,9 +312,14 @@ def main() -> None:
                         help="seconds to wait after a 'too many requests' page (default 600 = 10 min)")
     parser.add_argument("--heartbeat-hours", type=float, default=4.0,
                         help="hours between 'still alive' pings (0 = off, default 4)")
+    parser.add_argument("--confirm", type=int, default=2,
+                        help="extra re-checks required before firing an alert, to filter "
+                             "out transient false 'available' blips (0 = off, default 2)")
+    parser.add_argument("--confirm-delay", type=int, default=5,
+                        help="seconds between confirmation re-checks (default 5)")
     args = parser.parse_args()
     asyncio.run(Monitor(args.url, args.poll, args.heartbeat_hours, args.cooldown,
-                        args.service, args.jitter).run())
+                        args.service, args.jitter, args.confirm, args.confirm_delay).run())
 
 
 if __name__ == "__main__":
