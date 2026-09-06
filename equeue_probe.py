@@ -100,10 +100,34 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
         resp.read()
 
 
+def send_telegram_photo(token: str, chat_id: str, image: bytes, caption: str = "") -> None:
+    """Upload a PNG screenshot via sendPhoto (multipart/form-data, no deps)."""
+    url = "https://api.telegram.org/bot{}/sendPhoto".format(token)
+    boundary = "----equeue{}".format(int(time.time() * 1000))
+
+    def field(name: str, value: str) -> bytes:
+        return ("--{}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{}\r\n"
+                .format(boundary, name, value)).encode("utf-8")
+
+    body = field("chat_id", chat_id)
+    if caption:
+        body += field("caption", caption)
+    body += ("--{}\r\nContent-Disposition: form-data; name=\"photo\"; "
+             "filename=\"slot.png\"\r\nContent-Type: image/png\r\n\r\n"
+             .format(boundary)).encode("utf-8")
+    body += image
+    body += ("\r\n--{}--\r\n".format(boundary)).encode("utf-8")
+
+    req = urllib.request.Request(url, data=body)
+    req.add_header("Content-Type", "multipart/form-data; boundary={}".format(boundary))
+    with urllib.request.urlopen(req, timeout=30) as resp:  # nosec - user's own bot
+        resp.read()
+
+
 class Monitor:
     def __init__(self, url: str, poll: int, heartbeat_hours: float, cooldown: int,
                  service: str, jitter: int, confirm: int = 2, confirm_delay: int = 5,
-                 dump_only: bool = False) -> None:
+                 dump_only: bool = False, screenshot: bool = True) -> None:
         self.url = url
         self.poll = poll
         self.cooldown = cooldown
@@ -112,6 +136,7 @@ class Monitor:
         self.confirm = max(0, confirm)
         self.confirm_delay = max(1, confirm_delay)
         self.dump_only = dump_only
+        self.screenshot = screenshot
         self.heartbeat_sec = heartbeat_hours * 3600.0
         self.token = os.getenv("BOT_TOKEN", "").strip()
         self.chat_id = os.getenv("CHAT_ID", "").strip()
@@ -217,7 +242,7 @@ class Monitor:
                 return False
         return True
 
-    def alert(self) -> None:
+    def alert(self, screenshot: bytes = None) -> None:
         city = self.url.split("//")[-1].split(".")[0]
         text = "\n".join([
             "\U0001F7E2 Зʼявилась можливість запису! ({})".format(city),
@@ -225,11 +250,18 @@ class Monitor:
             self.url,
         ])
         print("\n[{}] *** ЗАПИС ВІДКРИВСЯ *** {}".format(ts(), self.url))
-        if self.tg_on:
-            self.notify(text)
-            print("[{}] telegram alert sent".format(ts()))
-        else:
+        if not self.tg_on:
             print("[{}] (Telegram OFF: set BOT_TOKEN/CHAT_ID in .env)".format(ts()))
+            return
+        if screenshot:
+            try:
+                send_telegram_photo(self.token, self.chat_id, screenshot, text)
+                print("[{}] telegram photo alert sent".format(ts()))
+                return
+            except Exception as e:
+                print("[{}] telegram photo failed, falling back to text: {}".format(ts(), e))
+        self.notify(text)
+        print("[{}] telegram alert sent".format(ts()))
 
     async def run(self) -> None:
         async with async_playwright() as pw:
@@ -316,7 +348,13 @@ class Monitor:
                             print("[{}] ВІЛЬНО — запис можливий!".format(ts()))
                             if not self.was_available:
                                 self.was_available = True
-                                self.alert()
+                                shot = None
+                                if self.screenshot:
+                                    try:
+                                        shot = await page.screenshot(full_page=False)
+                                    except Exception as e:
+                                        print("[{}] screenshot failed: {}".format(ts(), e))
+                                self.alert(shot)
                     else:  # busy
                         self.last_status = "зайнято"
                         print("[{}] зайнято (всі місця зайняті)".format(ts()))
@@ -353,10 +391,13 @@ def main() -> None:
     parser.add_argument("--dump", action="store_true",
                         help="one-shot: open page, select service, print detected status and "
                              "save the full body text to dump.txt, then exit")
+    parser.add_argument("--screenshot", action=argparse.BooleanOptionalAction, default=True,
+                        help="attach a viewport screenshot to the Telegram alert (default on; "
+                             "use --no-screenshot to disable)")
     args = parser.parse_args()
     asyncio.run(Monitor(args.url, args.poll, args.heartbeat_hours, args.cooldown,
                         args.service, args.jitter, args.confirm, args.confirm_delay,
-                        dump_only=args.dump).run())
+                        dump_only=args.dump, screenshot=args.screenshot).run())
 
 
 if __name__ == "__main__":
